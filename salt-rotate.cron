@@ -1,0 +1,14 @@
+# Weekly salt rotation — fires Monday 00:05 UTC.
+#
+# Generates a new 32-byte salt, writes it to $SALT_FILE (mode 0600), and
+# bounces the receiver process so SALT is reloaded. After rotation,
+# hashes from the previous week can no longer be correlated with hashes
+# from the new week, even given the same (ip, installation_id).
+#
+#   crontab -e   # add the following line, replacing paths
+
+5 0 * * 1 head -c 32 /dev/urandom | xxd -p -c 64 > /run/telemetry/salt.new \
+            && chmod 600 /run/telemetry/salt.new \
+            && mv /run/telemetry/salt.new /run/telemetry/salt \
+            && systemctl restart telemetry-receiver.service \
+            && /opt/telemetry/receiver/finalise-week.sh
