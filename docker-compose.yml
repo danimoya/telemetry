@@ -1,0 +1,53 @@
+services:
+  # HeliosDB-Nano stores the (week_bucket, hash, version) rows. The
+  # receiver workload is small and uses only basic SQL (no
+  # information_schema, no migrations framework), which sidesteps the
+  # TypeORM-blocking bugs documented for the dashboard at
+  # claude-dashboard:docs/heliosdb-bugs.md. Bootstrap runs CREATE TABLE
+  # IF NOT EXISTS from the receiver process on first connect.
+  heliosdb:
+    image: heliosdb-nano-v2:latest
+    container_name: telemetry-heliosdb
+    restart: unless-stopped
+    command:
+      - start
+      - --data-dir=/data
+      - --listen=0.0.0.0
+      - --port=5432
+      - --auth=trust
+    environment:
+      HELIOSDB_DATA_DIR: /data
+      HELIOSDB_LOG_LEVEL: info
+      RUST_BACKTRACE: "1"
+    volumes:
+      - telemetry_heliosdb:/data
+    networks:
+      - internal
+
+  receiver:
+    build: ./receiver
+    container_name: telemetry-receiver
+    restart: unless-stopped
+    environment:
+      PORT: "4080"
+      # Nano serves a single fixed database named `heliosdb`; user is
+      # the same. Auth=trust on the container-internal network only.
+      PG_URL: postgres://heliosdb@heliosdb:5432/heliosdb
+      SALT_FILE: /run/telemetry/salt
+    volumes:
+      - telemetry_salt:/run/telemetry
+    depends_on:
+      - heliosdb
+    networks:
+      - internal
+      - management-network
+
+volumes:
+  telemetry_heliosdb:
+  telemetry_salt:
+
+networks:
+  internal:
+    driver: bridge
+  management-network:
+    external: true
