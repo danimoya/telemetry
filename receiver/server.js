@@ -44,6 +44,17 @@ async function ensureSchema(retries = 30) {
      )`,
     `CREATE INDEX IF NOT EXISTS pings_week_idx ON pings (week_bucket)`,
     `CREATE INDEX IF NOT EXISTS pings_received_idx ON pings (received_at)`,
+    // pings_weekly is the kept-forever aggregate. The per-row pings
+    // table is pruned at 90 days; finalise-week.sh rolls each completed
+    // week into this table so history beyond the retention window
+    // survives. Without this, /v1/stats/history would silently lose
+    // weeks older than ~13 weeks.
+    `CREATE TABLE IF NOT EXISTS pings_weekly (
+       week_bucket  TEXT NOT NULL,
+       installs     INTEGER NOT NULL,
+       finalised_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+       PRIMARY KEY (week_bucket)
+     )`,
   ];
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -77,6 +88,33 @@ function isoWeekBucket(d = new Date()) {
   const yearStart = new Date(Date.UTC(t.getUTCFullYear(), 0, 1));
   const weekNo = Math.ceil(((t - yearStart) / 86400000 + 1) / 7);
   return `${t.getUTCFullYear()}-${String(weekNo).padStart(2, '0')}`;
+}
+
+// Step backwards by 7 days from the Thursday-of-week anchor; reuse the
+// same Thursday-anchoring trick isoWeekBucket() uses so that year
+// boundaries (e.g. 2026-W01 sitting in December 2025) come out right.
+function shiftIsoWeek(week, deltaWeeks) {
+  const m = /^(\d{4})-(\d{2})$/.exec(week);
+  if (!m) throw new Error(`bad week bucket: ${week}`);
+  const year = Number(m[1]);
+  const weekNo = Number(m[2]);
+  // The Thursday of an ISO week always lives inside its labelled year.
+  // Anchor at year's Jan 4 (guaranteed to be in W01), then add
+  // (weekNo - 1) * 7 days to land in the requested week's Thursday.
+  const jan4 = new Date(Date.UTC(year, 0, 4));
+  const jan4Day = jan4.getUTCDay() || 7;
+  const thursday = new Date(jan4);
+  thursday.setUTCDate(jan4.getUTCDate() + (weekNo - 1) * 7 + (4 - jan4Day));
+  thursday.setUTCDate(thursday.getUTCDate() + deltaWeeks * 7);
+  return isoWeekBucket(thursday);
+}
+
+// Build an inclusive ascending list of N ISO weeks ending at `endWeek`.
+//   weekRangeEndingAt('2026-21', 4) -> ['2026-18','2026-19','2026-20','2026-21']
+function weekRangeEndingAt(endWeek, count) {
+  const out = [];
+  for (let i = count - 1; i >= 0; i--) out.push(shiftIsoWeek(endWeek, -i));
+  return out;
 }
 
 const fastify = Fastify({ logger: true });
@@ -211,6 +249,315 @@ fastify.get('/v1/stats', async () => {
   };
 });
 
+/**
+ * Internal: fetch the historical weekly-active series for the most
+ * recent `weeks` ISO weeks, ending at the current week. Merges two
+ * sources:
+ *   - `pings_weekly` (kept forever, populated by finalise-week.sh)
+ *   - `pings`        (rolling 90-day raw rows, current+recent weeks)
+ * Returns a zero-filled, chronological array of {week, installs}.
+ */
+async function weeklyHistory(weeks) {
+  const currentWeek = isoWeekBucket();
+  if (!/^\d{4}-\d{2}$/.test(currentWeek)) throw new Error('bad week bucket');
+  const range = weekRangeEndingAt(currentWeek, weeks);
+  const earliest = range[0];
+
+  // Validated by regex on construction (shiftIsoWeek output), but assert
+  // before literal interpolation. Belt + braces given Bug #8 workaround.
+  if (!/^\d{4}-\d{2}$/.test(earliest)) throw new Error('bad earliest week');
+
+  const counts = new Map();
+  for (const w of range) counts.set(w, 0);
+
+  // Older buckets (already finalised) from the kept-forever aggregate.
+  const { rows: histAgg } = await pool.query(
+    `SELECT week_bucket, installs FROM pings_weekly
+      WHERE week_bucket >= '${earliest}'`
+  );
+  for (const r of histAgg) {
+    if (counts.has(r.week_bucket)) counts.set(r.week_bucket, Number(r.installs));
+  }
+
+  // Recent buckets (within retention) from the raw table — these are
+  // authoritative for not-yet-finalised weeks (this week + any week
+  // not yet rolled by finalise-week.sh). They overwrite the aggregate
+  // value, so a re-run of finalise-week.sh that lands a different
+  // count for the current week doesn't drift.
+  const { rows: recent } = await pool.query(
+    `SELECT week_bucket, COUNT(DISTINCT hash)
+       FROM pings
+      WHERE week_bucket >= '${earliest}'
+      GROUP BY week_bucket`
+  );
+  for (const r of recent) {
+    if (counts.has(r.week_bucket)) counts.set(r.week_bucket, Number(r.count));
+  }
+
+  return range.map((w) => ({ week: w, installs: counts.get(w) }));
+}
+
+fastify.get('/v1/stats/history', async (req) => {
+  // Clamp the requested window so a hostile or fat-fingered client
+  // can't ask for thousands of weeks (104 = ~2 years of data is the
+  // sensible upper bound for a public chart endpoint).
+  const raw = Number((req.query && req.query.weeks) ?? 13);
+  const weeks = Math.max(1, Math.min(104, Number.isFinite(raw) ? Math.floor(raw) : 13));
+  const series = await weeklyHistory(weeks);
+  return { weeks, series };
+});
+
+fastify.get('/v1/stats/cumulative', async (req) => {
+  const raw = Number((req.query && req.query.weeks) ?? 52);
+  const weeks = Math.max(1, Math.min(104, Number.isFinite(raw) ? Math.floor(raw) : 52));
+  const series = await weeklyHistory(weeks);
+  // Privacy-honest "cumulative": sum of weekly actives. The receiver
+  // can't compute "unique installs ever" because salts rotate weekly
+  // and hashes deliberately cannot be correlated across weeks. So this
+  // is total ping-events counted, an over-estimate of unique installs
+  // (an install that pings every week for a year contributes 52).
+  let running = 0;
+  const withCumulative = series.map((p) => {
+    running += p.installs;
+    return { ...p, cumulative: running };
+  });
+  return {
+    weeks,
+    firstWeek: series[0]?.week ?? null,
+    currentWeek: series[series.length - 1]?.week ?? null,
+    totalPingEvents: running,
+    series: withCumulative,
+    note:
+      'cumulative = sum of weekly-active counts. salts rotate weekly so the ' +
+      'receiver cannot compute unique-installs-ever; this is total ping-events ' +
+      'counted, an over-estimate.',
+  };
+});
+
+/**
+ * SVG-rendered chart page. No client-side JS, no third-party CDN, just
+ * server-side SVG embedded in HTML. Fits the receiver's no-tracker
+ * ethos and lets curl + text browsers see a sensible representation.
+ *
+ * Top panel: bar chart of weekly active installs (last 26 weeks).
+ * Bottom panel: cumulative line chart over the same window.
+ */
+fastify.get('/stats', async (req, reply) => {
+  const raw = Number((req.query && req.query.weeks) ?? 26);
+  const weeks = Math.max(4, Math.min(104, Number.isFinite(raw) ? Math.floor(raw) : 26));
+  const series = await weeklyHistory(weeks);
+
+  let running = 0;
+  const withCumulative = series.map((p) => {
+    running += p.installs;
+    return { ...p, cumulative: running };
+  });
+  const current = withCumulative[withCumulative.length - 1];
+  const peakWeekly = withCumulative.reduce((m, p) => Math.max(m, p.installs), 0);
+  const peakCum = withCumulative[withCumulative.length - 1]?.cumulative ?? 0;
+
+  reply.type('text/html');
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>telemetry.danimoya.com · stats</title>
+<style>
+  body{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0b0d10;color:#e6edf3;
+       margin:0;padding:2.5rem 1.5rem;line-height:1.55}
+  main{max-width:880px;margin:0 auto}
+  h1{font-size:1.5rem;margin:0 0 .25rem;letter-spacing:-.02em}
+  h2{font-size:.95rem;color:#79c0ff;margin:2.25rem 0 .5rem;text-transform:uppercase;
+     letter-spacing:.05em}
+  p,li{font-size:.92rem}
+  code{color:#79c0ff}
+  a{color:#79c0ff}
+  .nums{display:flex;gap:1.5rem;flex-wrap:wrap;margin:.75rem 0 0}
+  .num{padding:.85rem 1.1rem;background:#161b22;border:1px solid #30363d;border-radius:6px;
+       min-width:9rem}
+  .num .label{color:#8b949e;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em}
+  .num .value{font-size:1.55rem;color:#79c0ff;margin-top:.15rem}
+  .chart{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.75rem;
+         margin:.75rem 0;overflow-x:auto}
+  /* Selectors target <text class="tick"> and <text class="axis"> directly —
+     the earlier ".tick text" form matched a descendant, not the element
+     itself, so labels rendered with the default (black) fill and were
+     invisible on the near-black chart background. */
+  .axis,text.tick,text.axis{fill:#c9d1d9;font-size:11px;font-family:ui-monospace,Menlo,Consolas,monospace}
+  .grid{stroke:#30363d;stroke-width:1}
+  .bar{fill:#79c0ff}
+  .line{fill:none;stroke:#3fb950;stroke-width:1.75}
+  .footer{color:#8b949e;font-size:.78rem;margin-top:2.5rem;border-top:1px solid #30363d;
+          padding-top:1rem}
+  .note{color:#8b949e;font-size:.8rem;margin-top:.25rem}
+</style></head>
+<body><main>
+<h1>telemetry stats</h1>
+<p>Anonymous install pings reported to <code>telemetry.danimoya.com</code>,
+last ${weeks} ISO weeks ending <code>${current?.week ?? '—'}</code>.
+<a href="/">about</a> · <a href="/v1/stats">/v1/stats</a> ·
+<a href="/v1/stats/history?weeks=${weeks}">/v1/stats/history</a> ·
+<a href="/v1/stats/cumulative?weeks=${weeks}">/v1/stats/cumulative</a></p>
+
+<div class="nums">
+  <div class="num"><div class="label">This week</div>
+    <div class="value">${current?.installs ?? 0}</div></div>
+  <div class="num"><div class="label">Peak weekly</div>
+    <div class="value">${peakWeekly}</div></div>
+  <div class="num"><div class="label">Cumulative ping-events</div>
+    <div class="value">${peakCum}</div></div>
+  <div class="num"><div class="label">Window</div>
+    <div class="value" style="font-size:1.05rem">${withCumulative[0]?.week ?? '—'} → ${current?.week ?? '—'}</div></div>
+</div>
+
+<h2>Weekly active installs</h2>
+<div class="chart">${renderBarChart(withCumulative)}</div>
+
+<h2>Cumulative ping-events</h2>
+<div class="chart">${renderLineChart(withCumulative)}</div>
+<p class="note">"Cumulative" is the running sum of the weekly-active counts above —
+the only honest number the receiver can produce. Salts rotate weekly by design
+so hashes from week <em>N</em> cannot be matched to week <em>N+1</em>; a true
+"unique installs ever" figure is therefore <strong>not computable</strong> from
+this data. An install that opts in and pings every week for a year contributes
+52 to this number.</p>
+
+<h2>Other windows</h2>
+<p>
+<a href="/stats?weeks=13">13 weeks</a> ·
+<a href="/stats?weeks=26">26 weeks</a> ·
+<a href="/stats?weeks=52">52 weeks</a> ·
+<a href="/stats?weeks=104">104 weeks</a>
+</p>
+
+<p class="footer">No client-side JavaScript on this page. The SVG charts are
+rendered server-side from <code>/v1/stats/history</code> and
+<code>/v1/stats/cumulative</code>. The same numbers are accessible as JSON
+for anyone wanting to plot them locally.</p>
+</main></body></html>`;
+});
+
+// ── Server-side SVG renderers ──────────────────────────────────────
+//
+// Pure functions of the data — no DOM, no JS, no charting library.
+// The receiver's whole posture is "no client trackers and no
+// third-party CDN imports", and a small handful of <svg> elements
+// stays inside that posture. Designed for readability over polish:
+// gridlines, week labels, no axes-as-art.
+
+function svgEscape(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
+  );
+}
+
+function chartGeometry(points) {
+  // Shared coordinate system for bars + line: 800x220 with margins.
+  const W = 800;
+  const H = 220;
+  const M = { top: 14, right: 16, bottom: 32, left: 36 };
+  const innerW = W - M.left - M.right;
+  const innerH = H - M.top - M.bottom;
+  return { W, H, M, innerW, innerH, n: points.length };
+}
+
+function yTicks(maxValue) {
+  // Choose 4-5 round-number ticks above max, with a floor of 1 so an
+  // all-zero chart still shows a baseline at 0/1.
+  const ceil = Math.max(1, maxValue);
+  // Round up to a "nice" number: 1,2,5,10,20,50,100,…
+  const niceSteps = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000];
+  const step = niceSteps.find((s) => s * 4 >= ceil) || 10000;
+  const top = step * 4;
+  return { top, ticks: [0, step, step * 2, step * 3, top] };
+}
+
+function renderBarChart(points) {
+  const g = chartGeometry(points);
+  const max = points.reduce((m, p) => Math.max(m, p.installs), 0);
+  const { top: yMax, ticks } = yTicks(max);
+  const barW = g.innerW / Math.max(g.n, 1);
+  const xOf = (i) => g.M.left + i * barW + barW * 0.15;
+  const yOf = (v) => g.M.top + (1 - v / yMax) * g.innerH;
+
+  const grid = ticks
+    .map((t) => {
+      const y = yOf(t).toFixed(1);
+      return `<line class="grid" x1="${g.M.left}" x2="${g.M.left + g.innerW}" y1="${y}" y2="${y}"/>` +
+        `<text class="tick" x="${g.M.left - 4}" y="${y}" text-anchor="end" dy="3">${t}</text>`;
+    })
+    .join('');
+
+  const bars = points
+    .map((p, i) => {
+      const x = xOf(i);
+      const y = yOf(p.installs);
+      const h = g.M.top + g.innerH - y;
+      const w = barW * 0.7;
+      return `<rect class="bar" x="${x.toFixed(1)}" y="${y.toFixed(1)}" ` +
+        `width="${w.toFixed(1)}" height="${Math.max(h, 0).toFixed(1)}"><title>` +
+        `${svgEscape(p.week)}: ${p.installs}</title></rect>`;
+    })
+    .join('');
+
+  // Label every Nth week so the x-axis stays legible on long windows.
+  const labelStride = Math.max(1, Math.ceil(g.n / 13));
+  const labels = points
+    .map((p, i) => {
+      if (i % labelStride !== 0 && i !== g.n - 1) return '';
+      const x = (xOf(i) + barW * 0.35).toFixed(1);
+      const y = (g.M.top + g.innerH + 14).toFixed(1);
+      return `<text class="tick" x="${x}" y="${y}" text-anchor="middle">${svgEscape(p.week)}</text>`;
+    })
+    .join('');
+
+  return `<svg viewBox="0 0 ${g.W} ${g.H}" width="100%" preserveAspectRatio="xMinYMid meet" ` +
+    `role="img" aria-label="Weekly active installs">${grid}${bars}${labels}</svg>`;
+}
+
+function renderLineChart(points) {
+  const g = chartGeometry(points);
+  const max = points.reduce((m, p) => Math.max(m, p.cumulative), 0);
+  const { top: yMax, ticks } = yTicks(max);
+  const xStep = g.innerW / Math.max(g.n - 1, 1);
+  const xOf = (i) => g.M.left + i * xStep;
+  const yOf = (v) => g.M.top + (1 - v / yMax) * g.innerH;
+
+  const grid = ticks
+    .map((t) => {
+      const y = yOf(t).toFixed(1);
+      return `<line class="grid" x1="${g.M.left}" x2="${g.M.left + g.innerW}" y1="${y}" y2="${y}"/>` +
+        `<text class="tick" x="${g.M.left - 4}" y="${y}" text-anchor="end" dy="3">${t}</text>`;
+    })
+    .join('');
+
+  const path = points
+    .map((p, i) => `${i === 0 ? 'M' : 'L'}${xOf(i).toFixed(1)},${yOf(p.cumulative).toFixed(1)}`)
+    .join(' ');
+
+  const labelStride = Math.max(1, Math.ceil(g.n / 13));
+  const labels = points
+    .map((p, i) => {
+      if (i % labelStride !== 0 && i !== g.n - 1) return '';
+      const x = xOf(i).toFixed(1);
+      const y = (g.M.top + g.innerH + 14).toFixed(1);
+      return `<text class="tick" x="${x}" y="${y}" text-anchor="middle">${svgEscape(p.week)}</text>`;
+    })
+    .join('');
+
+  const dots = points
+    .map((p, i) => {
+      const x = xOf(i).toFixed(1);
+      const y = yOf(p.cumulative).toFixed(1);
+      return `<circle cx="${x}" cy="${y}" r="2.5" fill="#3fb950"><title>` +
+        `${svgEscape(p.week)}: ${p.cumulative} cumulative</title></circle>`;
+    })
+    .join('');
+
+  return `<svg viewBox="0 0 ${g.W} ${g.H}" width="100%" preserveAspectRatio="xMinYMid meet" ` +
+    `role="img" aria-label="Cumulative ping-events">${grid}` +
+    `<path class="line" d="${path}"/>${dots}${labels}</svg>`;
+}
+
 // Tiny public landing page. The per-install /telemetry page on each
 // dashboard explains what gets sent; this one explains who's collecting
 // it. No tracker, no JS, single HTML response.
@@ -252,10 +599,19 @@ and stores only the hash + version columns. Raw IP and the raw
 <code>(ip, id)</code> tuple are never persisted. Salt rotates weekly so
 hashes from week N can't be cross-correlated with hashes from week N+1.</p>
 
+<h2>Public stats</h2>
+<p>Open <a href="/stats"><code>/stats</code></a> for a per-week chart of
+reported installs and cumulative ping-events. JSON for the same numbers
+is available at <a href="/v1/stats/history?weeks=26"><code>/v1/stats/history</code></a>
+and <a href="/v1/stats/cumulative?weeks=52"><code>/v1/stats/cumulative</code></a>.</p>
+
 <h2>Endpoints</h2>
 <ul>
   <li><code>POST /v1/ping</code> — submit a ping (called by the dashboards)</li>
-  <li><code>GET  /v1/stats</code> — weekly aggregate count, public</li>
+  <li><code>GET  /v1/stats</code> — current week aggregate, public</li>
+  <li><code>GET  /v1/stats/history?weeks=N</code> — last N weeks of installs (N ≤ 104), public</li>
+  <li><code>GET  /v1/stats/cumulative?weeks=N</code> — same series with a running sum, public</li>
+  <li><code>GET  /stats</code> — SVG-rendered chart of the above</li>
 </ul>
 
 <h2>Source</h2>
