@@ -15,10 +15,88 @@ import Fastify from 'fastify';
 import pg from 'pg';
 import { createHash, randomBytes } from 'crypto';
 import { readFile } from 'fs/promises';
+import { pathToFileURL } from 'url';
+
+// Canonical ISO-week-bucket shape. The only values ever interpolated
+// into raw SQL text (see Bug #8 workaround below) must match this.
+export const WEEK_BUCKET_RE = /^\d{4}-\d{2}$/;
+
+/**
+ * Guard for every value that gets literally interpolated into a SQL
+ * string as part of the HeliosDB-Nano Bug #8 workaround (parameterised
+ * SELECTs crash, so week buckets are inlined). Throws unless the value
+ * is exactly `YYYY-WW`. Centralised here so the regex guard cannot be
+ * silently dropped at one call site while others keep interpolating —
+ * every interpolation goes through this one function. Covered by
+ * server.test.js, which fails if this stops throwing on bad input.
+ */
+export function assertWeekBucket(week, label = 'week bucket') {
+  if (typeof week !== 'string' || !WEEK_BUCKET_RE.test(week)) {
+    throw new Error(`bad ${label}: ${week}`);
+  }
+  return week;
+}
 
 const PORT = Number(process.env.PORT || 4080);
 const SALT_FILE = process.env.SALT_FILE || '/run/telemetry/salt';
 const PG_URL = process.env.PG_URL || 'postgres://telemetry@localhost/telemetry';
+
+// ── Public-intake rate limiting ────────────────────────────────────
+// Both /v1/ping paths are public + unauthenticated. The dedup key is
+// (week_bucket, hash) with an attacker-controlled installation_id, so an
+// attacker who rotates installation_id (or source IP) can mint unlimited
+// distinct rows — inflating the published "weekly active installs" figure
+// (metric fraud) and growing the pings table unbounded within a week
+// (storage exhaustion). Cap intake per client to a small per-minute
+// budget. Self-contained (no new dependency, in line with the receiver's
+// "no external deps beyond Fastify + pg" posture); fail-closed: if env is
+// missing or malformed, fall back to safe defaults rather than disabling.
+function posInt(v, dflt) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : dflt;
+}
+// Max requests per window per client IP for /v1/ping. Defaults: 10/min.
+const PING_RL_MAX = posInt(process.env.PING_RATELIMIT_MAX, 10);
+const PING_RL_WINDOW_MS = posInt(process.env.PING_RATELIMIT_WINDOW_MS, 60000);
+// The receiver sits behind NPM (TLS-terminated edge), so req.socket sees
+// the proxy IP. Trust X-Forwarded-For to key the limiter on the real
+// client. Disable with TRUST_PROXY=false for a direct-exposure deploy.
+const TRUST_PROXY = String(process.env.TRUST_PROXY ?? 'true').toLowerCase() !== 'false';
+
+// Fixed-window counters: clientIp -> { count, resetAt }. Memory is bounded
+// by a periodic sweep of expired buckets (window is short, so the live set
+// is "distinct client IPs seen in the last window").
+const rlBuckets = new Map();
+function rateLimitClientIp(req) {
+  if (TRUST_PROXY) {
+    const xff = req.headers['x-forwarded-for'];
+    if (typeof xff === 'string' && xff.length > 0) {
+      // Left-most entry is the original client per the XFF convention.
+      const first = xff.split(',')[0].trim();
+      if (first) return first;
+    }
+  }
+  return req.ip;
+}
+function rateLimitCheck(key, now) {
+  const b = rlBuckets.get(key);
+  if (!b || now >= b.resetAt) {
+    const resetAt = now + PING_RL_WINDOW_MS;
+    rlBuckets.set(key, { count: 1, resetAt });
+    return { ok: true, remaining: PING_RL_MAX - 1, resetAt };
+  }
+  if (b.count >= PING_RL_MAX) {
+    return { ok: false, remaining: 0, resetAt: b.resetAt };
+  }
+  b.count += 1;
+  return { ok: true, remaining: PING_RL_MAX - b.count, resetAt: b.resetAt };
+}
+// Sweep expired buckets so the Map can't grow without bound. unref() keeps
+// the timer from holding the event loop open at shutdown.
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, b] of rlBuckets) if (now >= b.resetAt) rlBuckets.delete(k);
+}, Math.max(PING_RL_WINDOW_MS, 1000)).unref();
 
 const pool = new pg.Pool({ connectionString: PG_URL });
 
@@ -77,10 +155,13 @@ async function loadSalt() {
   }
 }
 
-await ensureSchema();
-const SALT = await loadSalt();
+// Populated by the entrypoint bootstrap below. Left undefined when this
+// module is imported (e.g. by server.test.js), so importing it for unit
+// tests does not connect to the DB, read the salt, or open a port — the
+// pure helpers and assertWeekBucket() below have no dependency on it.
+let SALT;
 
-function isoWeekBucket(d = new Date()) {
+export function isoWeekBucket(d = new Date()) {
   // ISO-8601 week, returns "YYYY-WW".
   const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
   const day = t.getUTCDay() || 7;
@@ -93,7 +174,7 @@ function isoWeekBucket(d = new Date()) {
 // Step backwards by 7 days from the Thursday-of-week anchor; reuse the
 // same Thursday-anchoring trick isoWeekBucket() uses so that year
 // boundaries (e.g. 2026-W01 sitting in December 2025) come out right.
-function shiftIsoWeek(week, deltaWeeks) {
+export function shiftIsoWeek(week, deltaWeeks) {
   const m = /^(\d{4})-(\d{2})$/.exec(week);
   if (!m) throw new Error(`bad week bucket: ${week}`);
   const year = Number(m[1]);
@@ -111,13 +192,23 @@ function shiftIsoWeek(week, deltaWeeks) {
 
 // Build an inclusive ascending list of N ISO weeks ending at `endWeek`.
 //   weekRangeEndingAt('2026-21', 4) -> ['2026-18','2026-19','2026-20','2026-21']
-function weekRangeEndingAt(endWeek, count) {
+export function weekRangeEndingAt(endWeek, count) {
   const out = [];
   for (let i = count - 1; i >= 0; i--) out.push(shiftIsoWeek(endWeek, -i));
   return out;
 }
 
-const fastify = Fastify({ logger: true });
+// trustProxy: this receiver always runs behind the NPM (nginx) TLS-
+// terminating edge on `management-network`. Without trustProxy, req.ip is
+// the proxy's docker IP — a near-constant for every real client — which
+// collapses the (salt|week|ip|id) hash onto the client-supplied
+// installation_id alone, breaking the dedup/anti-correlation design and
+// making the published privacy claim ("hashes your_ip") untrue. With
+// trustProxy enabled Fastify resolves req.ip from X-Forwarded-For so the
+// real client address is mixed into the hash again. NPM must forward
+// X-Forwarded-For (its default). If the edge is ever exposed without a
+// trusted proxy in front, narrow this to the proxy's CIDR.
+const fastify = Fastify({ logger: true, trustProxy: true });
 
 // Permit cross-origin reads of the public landing page + /v1/stats. The
 // dashboard's per-install /telemetry page renders the headline count
@@ -126,6 +217,24 @@ fastify.addHook('onSend', async (_req, reply, payload) => {
   reply.header('Access-Control-Allow-Origin', '*');
   reply.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   reply.header('Access-Control-Allow-Headers', 'Content-Type');
+  // Static hardening headers. The HTML pages are server-rendered, JS-free,
+  // and use inline <style> + inline <svg>, so a tight CSP is safe:
+  //  - default-src 'none'        : nothing loads by default
+  //  - style-src 'unsafe-inline' : pages carry inline <style> blocks
+  //  - img-src 'self' data:      : allow inline data: images if any
+  //  - base-uri 'none'           : no <base> hijacking
+  //  - frame-ancestors 'none'    : clickjacking defense (pairs with XFO)
+  // nosniff blocks MIME-confusion; no-referrer avoids leaking the URL
+  // (the GET /v1/ping browser-paste path carries the installation_id in
+  // the query string, so suppressing Referer is a privacy win too).
+  reply.header('X-Content-Type-Options', 'nosniff');
+  reply.header('X-Frame-Options', 'DENY');
+  reply.header('Referrer-Policy', 'no-referrer');
+  reply.header(
+    'Content-Security-Policy',
+    "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; " +
+      "base-uri 'none'; frame-ancestors 'none'"
+  );
   return payload;
 });
 fastify.options('/v1/*', async (_req, reply) => reply.code(204).send());
@@ -166,7 +275,39 @@ async function recordPing(req, body) {
   return { code: 200, ok: true, week };
 }
 
-fastify.post('/v1/ping', async (req, reply) => {
+// preHandler that enforces the per-client intake budget on both /v1/ping
+// paths. Sets standard RateLimit-* headers; on breach returns 429 with a
+// Retry-After. `html` controls the breach body so the GET (browser-paste)
+// path stays consistent with its themed error page.
+function pingRateLimit(html) {
+  return async (req, reply) => {
+    const key = rateLimitClientIp(req);
+    const now = Date.now();
+    const res = rateLimitCheck(key, now);
+    reply.header('RateLimit-Limit', String(PING_RL_MAX));
+    reply.header('RateLimit-Remaining', String(Math.max(res.remaining, 0)));
+    reply.header('RateLimit-Reset', String(Math.ceil((res.resetAt - now) / 1000)));
+    if (!res.ok) {
+      const retryAfter = Math.max(1, Math.ceil((res.resetAt - now) / 1000));
+      reply.header('Retry-After', String(retryAfter));
+      reply.code(429);
+      if (html) {
+        reply.type('text/html');
+        return reply.send(`<!doctype html><meta charset=utf-8>
+<title>telemetry · 429</title>
+<body style="font-family:ui-monospace,Menlo,monospace;background:#0b0d10;color:#f85149;
+            margin:0;padding:3rem 1.5rem">
+<main style="max-width:560px;margin:0 auto">
+<h1 style="margin:0 0 .5rem">Too many requests</h1>
+<p>HTTP 429 · retry after ${retryAfter}s</p>
+<p><a style="color:#79c0ff" href="/">back</a></p></main>`);
+      }
+      return reply.send({ error: 'rate limit exceeded', retry_after: retryAfter });
+    }
+  };
+}
+
+fastify.post('/v1/ping', { preHandler: pingRateLimit(false) }, async (req, reply) => {
   const r = await recordPing(req, req.body || {});
   if (r.code !== 200) return reply.code(r.code).send({ error: r.error });
   return { ok: true };
@@ -184,7 +325,7 @@ fastify.post('/v1/ping', async (req, reply) => {
  * The `timestamp` query param is accepted for parity with the POST body
  * but isn't used for dedupe (which keys on week_bucket + hash).
  */
-fastify.get('/v1/ping', async (req, reply) => {
+fastify.get('/v1/ping', { preHandler: pingRateLimit(true) }, async (req, reply) => {
   const q = req.query || {};
   const r = await recordPing(req, {
     installation_id: q.installation_id,
@@ -230,7 +371,7 @@ fastify.get('/v1/stats', async () => {
   // returned key, not our requested alias. Re-introduce aliases when
   // upstream is fixed.
   const week = isoWeekBucket();
-  if (!/^\d{4}-\d{2}$/.test(week)) throw new Error('bad week bucket');
+  assertWeekBucket(week);
   const { rows } = await pool.query(
     `SELECT COUNT(DISTINCT hash) FROM pings WHERE week_bucket = '${week}'`
   );
@@ -259,13 +400,13 @@ fastify.get('/v1/stats', async () => {
  */
 async function weeklyHistory(weeks) {
   const currentWeek = isoWeekBucket();
-  if (!/^\d{4}-\d{2}$/.test(currentWeek)) throw new Error('bad week bucket');
+  assertWeekBucket(currentWeek);
   const range = weekRangeEndingAt(currentWeek, weeks);
   const earliest = range[0];
 
   // Validated by regex on construction (shiftIsoWeek output), but assert
   // before literal interpolation. Belt + braces given Bug #8 workaround.
-  if (!/^\d{4}-\d{2}$/.test(earliest)) throw new Error('bad earliest week');
+  assertWeekBucket(earliest, 'earliest week');
 
   const counts = new Map();
   for (const w of range) counts.set(w, 0);
@@ -628,4 +769,12 @@ salt rotation: ${isoWeekBucket()}.</p>
 </main></body></html>`;
 });
 
-fastify.listen({ host: '0.0.0.0', port: PORT });
+// Entrypoint bootstrap. Only runs when this file is executed directly
+// (`node server.js`), not when imported by a unit test. This keeps the
+// DB connect, salt load, and port bind out of the import path so the
+// pure helpers + assertWeekBucket() can be tested in isolation.
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+  await ensureSchema();
+  SALT = await loadSalt();
+  fastify.listen({ host: '0.0.0.0', port: PORT });
+}
