@@ -14,7 +14,9 @@ services:
       - --data-dir=/data
       - --listen=0.0.0.0
       - --port=5432
-      - --auth=trust
+      # Nano >= 3.32 refuses trust auth on 0.0.0.0 (crash-looped from 2026-05-25 to 2026-10-01).
+      - --auth=password
+      - --password=${TELEMETRY_DB_PASSWORD:?set TELEMETRY_DB_PASSWORD in .env}
     environment:
       HELIOSDB_DATA_DIR: /data
       HELIOSDB_LOG_LEVEL: info
@@ -32,7 +34,7 @@ services:
       PORT: "4080"
       # Nano serves a single fixed database named `heliosdb`; user is
       # the same. Auth=trust on the container-internal network only.
-      PG_URL: postgres://heliosdb@heliosdb:5432/heliosdb
+      PG_URL: postgres://heliosdb:${TELEMETRY_DB_PASSWORD}@heliosdb:5432/heliosdb
       SALT_FILE: /run/telemetry/salt
     volumes:
       - telemetry_salt:/run/telemetry
