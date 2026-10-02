@@ -24,8 +24,9 @@ CREATE TABLE IF NOT EXISTS pings (
 CREATE INDEX IF NOT EXISTS pings_week_idx ON pings (week_bucket);
 CREATE INDEX IF NOT EXISTS pings_received_idx ON pings (received_at);
 
--- Retention: drop per-row rows older than 90 days. The aggregate counts are
--- materialised into `pings_weekly` (run by salt-rotate.cron) so we lose row
+-- Retention: per-row rows are deleted once their ISO week ended more than 90
+-- days ago. receiver/finalise-week.sh (weekly, see salt-rotate.cron) first
+-- materialises each completed week's count into `pings_weekly`, so we lose row
 -- granularity but keep the trend forever.
 CREATE TABLE IF NOT EXISTS pings_weekly (
   week_bucket        TEXT PRIMARY KEY,

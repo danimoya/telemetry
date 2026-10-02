@@ -133,3 +133,15 @@ Deployed 2026-10-02 09:47:57–09:48:14 UTC (images built from commit `6375b97`;
 receiver, stack recreated so the `telemetry_db` network could be rebuilt without a host address).
 Rollback images: `telemetry-heliosdb:rollback-20261002-premask`,
 `telemetry-receiver:rollback-20261002-presalt`; commands in the private runbook (section 10.6).
+
+## Retention enforced (2026-10-02, later)
+
+The 90-day per-row retention was not enforced and `finalise-week.sh` was not scheduled. It now
+runs weekly (Monday 00:05 UTC). On 4.41 it upserts one week per statement, because
+`INSERT ... SELECT ... GROUP BY ... ON CONFLICT DO UPDATE` fails with a primary-key violation once
+a week exists. It then deletes old weeks one literal `DELETE` at a time, because `IN (SELECT ...)`
+is not supported in `DELETE`. The first run deleted the 10 rows of weeks 2026-18 to 2026-23, and
+`/v1/stats/history` was byte-identical before and after. Pruning keys on `week_bucket`, so the
+migrated 2026-40 row with a NULL `received_at` is handled like any other row. New rows get `now()`:
+`information_schema` shows the default, and a scratch-table insert on 4.41 filled it.
+

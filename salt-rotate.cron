@@ -6,7 +6,8 @@
 # (receiver/persisted-salt.js). Last week's salt is overwritten, so hashes from different weeks
 # cannot be linked.
 #
-# Still needed weekly: roll completed weeks into pings_weekly (see finalise-week.sh). Example entry
-# for the app user's crontab (Monday 00:05 UTC):
+# Still needed weekly (installed since 2026-10-02): roll completed weeks into pings_weekly, then delete
+# the per-row rows of every ISO week that ended more than 90 days ago (receiver/finalise-week.sh).
+# Entry for the operator's crontab (Monday 00:05 UTC), with <checkout> the path of this repository:
 #
-#   5 0 * * 1 FINALISE_LOG=$HOME/.local/state/telemetry-finalise.log /opt/telemetry/receiver/finalise-week.sh
+#   5 0 * * 1 FINALISE_LOG=$HOME/.local/state/telemetry-finalise.log /usr/bin/flock -n /tmp/telemetry-finalise.lock <checkout>/receiver/finalise-week.sh >/dev/null 2>>$HOME/.local/state/telemetry-finalise.err.log

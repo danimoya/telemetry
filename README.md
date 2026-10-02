@@ -54,7 +54,7 @@ SELECT COUNT(DISTINCT hash) AS installs
  );
 ```
 
-Per-row data is dropped after **90 days**. Aggregate counts are kept indefinitely.
+Per-row data is dropped after **90 days**: every Monday `receiver/finalise-week.sh` stores each completed week's count in `pings_weekly`, then deletes the rows of every ISO week that ended more than 90 days ago, so a row is gone within 97 days. Aggregate counts are kept indefinitely. Encrypted backups of the store are kept for up to 3 months.
 
 ## What it does NOT do
 

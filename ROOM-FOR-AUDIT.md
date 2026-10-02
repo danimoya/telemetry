@@ -51,3 +51,20 @@ schema/code to verify that the policy and the implementation agree.
   2026-10-02 entry) were checked against the encrypted store's copy and then deleted from that
   database. The operator keeps a private export of them for rollback only.
 - Fields, hashing inputs and retention are unchanged.
+
+## 2026-10-02 (later) — 90-day retention enforced
+
+- Correction: the 90-day per-row retention stated since 2026-05-03 was not enforced. No job pruned
+  `pings` and the weekly roll-up into `pings_weekly` was not scheduled, so rows from 2026-05-03
+  onwards were still stored (10 rows from weeks 2026-18 to 2026-23 were older than 90 days).
+- Now: `receiver/finalise-week.sh` runs every Monday 00:05 UTC. It stores the weekly count of each
+  completed week in `pings_weekly`, then deletes the per-row rows of every ISO week that ended
+  more than 90 days ago, so a row is deleted within 97 days of being received. A week is deleted only
+  after its stored count matches the rows. It first ran on 2026-10-02 and deleted those 10 rows. The
+  published weekly counts did not change.
+- Backups: the encrypted backups of the store are kept for up to 3 months (daily 7, weekly 4,
+  monthly 3), so a deleted row can remain in a backup for up to 3 months after it leaves the store.
+- Operator-held exports: the rollback exports made during the 2026-10-02 move, cleanup and first
+  prune, including the private export named in the previous entry, are deleted on 2026-11-02. A
+  scheduled job does it, and no other exports are kept.
+- Fields and hashing inputs are unchanged.
