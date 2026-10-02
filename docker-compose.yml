@@ -15,6 +15,9 @@ services:
     image: telemetry-heliosdb:4.41.0
     container_name: telemetry-heliosdb
     restart: unless-stopped
+    # tini as PID 1: reaps nano-mask-argv, which masks --password in the engine's argv once it listens
+    # (db/nano/mask-argv.pl). Nano 4.41 accepts the password only on its command line.
+    init: true
     environment:
       TLS_CN: telemetry-heliosdb
     secrets:
@@ -45,9 +48,12 @@ services:
       # only (HeliosDB-Nano #49). No password in the URL: the entrypoint exports PGPASSWORD from the
       # secret. verify-full pins the self-signed server certificate and checks the host name.
       PG_URL: postgresql://postgres@telemetry-heliosdb:5432/heliosdb?sslmode=verify-full&sslrootcert=/tls-pub/server.crt
+      # Weekly salt, persisted on the telemetry_salt volume (receiver/persisted-salt.js). Not tmpfs:
+      # a restart would lose it and count every installation that pings again twice that week.
       SALT_FILE: /run/telemetry/salt
     secrets:
-      - source: telemetry_db
+      # Its own file with DB_PASSWORD only; the receiver never gets DB_ENCRYPTION_KEY.
+      - source: telemetry_db_client
         target: db.env
     volumes:
       - telemetry_salt:/run/telemetry
@@ -60,8 +66,12 @@ services:
       - management-network
 
 secrets:
+  # DB_PASSWORD + DB_ENCRYPTION_KEY, for the engine only.
   telemetry_db:
     file: /etc/heliosdb-telemetry/db.env
+  # DB_PASSWORD only, for the receiver. Both are written by ops/rotate-db-password.sh.
+  telemetry_db_client:
+    file: /etc/heliosdb-telemetry/receiver.env
 
 volumes:
   telemetry_heliosdb_441:
@@ -71,9 +81,15 @@ volumes:
 
 networks:
   # Database traffic only. Pinned: Docker's default address pools are exhausted on this host.
+  # inhibit_ipv4: the host gets no address on this bridge, so no host process (any local user) can
+  # open a connection to the engine; only containers on this network (the receiver) can. The engine
+  # itself accepts plaintext and classical-only TLS (Nano 4.41 hard-codes SslMode::Prefer,
+  # HeliosDB-Nano #53), so who can reach it is what keeps every connection on PQC TLS.
   db:
     driver: bridge
     internal: true
+    driver_opts:
+      com.docker.network.bridge.inhibit_ipv4: "true"
     ipam:
       config:
         - subnet: 10.250.20.0/24

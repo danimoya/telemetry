@@ -7,14 +7,15 @@
  * (week_bucket, hash, dashboard_version, heliosdb_version, received_at).
  * The raw IP and the raw installation_id are not written anywhere.
  *
- * No external dependencies beyond Fastify + pg. Salt is held in memory
- * and rotated by a weekly cron that restarts this process.
+ * No external dependencies beyond Fastify + pg. The salt is persisted per
+ * ISO week at SALT_FILE (persisted-salt.js) and replaced by a fresh random
+ * salt on the first ping of each new week.
  */
 
 import Fastify from 'fastify';
 import pg from 'pg';
-import { createHash, randomBytes } from 'crypto';
-import { readFile } from 'fs/promises';
+import { createHash } from 'crypto';
+import { createWeeklySalt } from './persisted-salt.js';
 import { pathToFileURL } from 'url';
 
 // Canonical ISO-week-bucket shape. The only values ever interpolated
@@ -117,7 +118,10 @@ async function ensureSchema(retries = 30) {
        hash               TEXT NOT NULL,
        dashboard_version  TEXT NOT NULL,
        heliosdb_version   TEXT,
-       received_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+       -- Nullable on purpose: one migrated 2026-40 row has no received_at (the pre-2026-10-02
+       -- engine did not apply the default). New rows always get now(). Keep in step with
+       -- schema.sql and the live table (docs/NANO-4.41-MIGRATION.md).
+       received_at        TIMESTAMPTZ DEFAULT now(),
        PRIMARY KEY (week_bucket, hash)
      )`,
     `CREATE INDEX IF NOT EXISTS pings_week_idx ON pings (week_bucket)`,
@@ -145,21 +149,15 @@ async function ensureSchema(retries = 30) {
   }
 }
 
-async function loadSalt() {
-  try {
-    return (await readFile(SALT_FILE, 'utf8')).trim();
-  } catch {
-    // No salt file yet — generate one in memory only. Operators should
-    // run salt-rotate.cron to persist a sealed weekly salt.
-    return randomBytes(32).toString('hex');
-  }
-}
+// Weekly salt persisted at SALT_FILE (persisted-salt.js): the same salt for the whole ISO week
+// across receiver restarts, a fresh one from the first ping of the next week.
+const weeklySalt = createWeeklySalt(SALT_FILE);
 
-// Populated by the entrypoint bootstrap below. Left undefined when this
-// module is imported (e.g. by server.test.js), so importing it for unit
-// tests does not connect to the DB, read the salt, or open a port — the
-// pure helpers and assertWeekBucket() below have no dependency on it.
-let SALT;
+// Startup check: reads (or creates) the current week's salt, so a missing or unwritable salt
+// volume or a malformed salt file stops the receiver instead of surfacing on the first ping.
+async function loadSalt() {
+  return weeklySalt.forWeek(isoWeekBucket());
+}
 
 export function isoWeekBucket(d = new Date()) {
   // ISO-8601 week, returns "YYYY-WW".
@@ -258,7 +256,14 @@ async function recordPing(req, body) {
   }
 
   const week = isoWeekBucket();
-  const hash = createHash('sha256').update(`${SALT}|${week}|${ip}|${id}`).digest('hex');
+  let salt;
+  try {
+    salt = await weeklySalt.forWeek(week);
+  } catch (err) {
+    req.log.error({ err }, 'salt unavailable');
+    return { code: 500, error: 'storage failure' };
+  }
+  const hash = createHash('sha256').update(`${salt}|${week}|${ip}|${id}`).digest('hex');
 
   try {
     await pool.query(
@@ -756,7 +761,7 @@ and <a href="/v1/stats/cumulative?weeks=52"><code>/v1/stats/cumulative</code></a
 </ul>
 
 <h2>Source</h2>
-<p>Receiver source, schema, salt-rotation cron, and append-only audit
+<p>Receiver source, schema, weekly salt rotation, and append-only audit
 changelog: <a href="https://github.com/danimoya/telemetry">github.com/danimoya/telemetry</a>.</p>
 
 <h2>Per-install transparency</h2>
@@ -769,12 +774,21 @@ salt rotation: ${isoWeekBucket()}.</p>
 </main></body></html>`;
 });
 
-// Entrypoint bootstrap. Only runs when this file is executed directly
-// (`node server.js`), not when imported by a unit test. This keeps the
-// DB connect, salt load, and port bind out of the import path so the
-// pure helpers + assertWeekBucket() can be tested in isolation.
+export async function startServer({
+  ensureSchemaFn = ensureSchema,
+  loadSaltFn = loadSalt,
+  listenFn = () => fastify.listen({ host: '0.0.0.0', port: PORT }),
+} = {}) {
+  await ensureSchemaFn();
+  await loadSaltFn();
+  return await listenFn();
+}
+
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  await ensureSchema();
-  SALT = await loadSalt();
-  fastify.listen({ host: '0.0.0.0', port: PORT });
+  try {
+    await startServer();
+  } catch (err) {
+    fastify.log.error({ err }, 'startup failed');
+    process.exit(1);
+  }
 }

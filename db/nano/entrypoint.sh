@@ -57,6 +57,15 @@ Environment = "HELIOSDB_ENCRYPTION_KEY"
 TOML
 chmod 0644 "$CONFIG"
 
+# 4.41 accepts the password only as --password (no environment variable or file option), so it is
+# in the engine's argv and readable by every host user through /proc/<pid>/cmdline. nano-mask-argv
+# waits until the engine listens, then overwrites the value with '*' in the engine's argv memory.
+# It runs as the engine's uid, and its pid is this shell's pid, which `exec` turns into the engine.
+# The subshell exits at once, so the helper is re-parented to the container's init (compose
+# `init: true`), which reaps it. A failure is logged; the engine keeps running.
+( setpriv --reuid=999 --regid=999 --clear-groups --inh-caps=-all \
+    perl /usr/local/bin/nano-mask-argv "$$" 5432 </dev/null & )
+
 exec setpriv --reuid=999 --regid=999 --clear-groups --inh-caps=-all \
   env -u DB_PASSWORD -u DB_ENCRYPTION_KEY HELIOSDB_ENCRYPTION_KEY="$DB_ENCRYPTION_KEY" HOME=/home/heliosdb \
   heliosdb-nano start -c "$CONFIG" \

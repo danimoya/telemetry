@@ -18,7 +18,8 @@ ENV NANO_VERSION=${NANO_VERSION}
 RUN useradd -r -u 999 -m -d /home/heliosdb heliosdb && mkdir -p /data /tls /tls-pub \
     && chown heliosdb:heliosdb /data /tls /tls-pub && chmod 0700 /tls
 COPY entrypoint.sh /usr/local/bin/nano-entrypoint
-RUN chmod 0755 /usr/local/bin/nano-entrypoint
+COPY mask-argv.pl /usr/local/bin/nano-mask-argv
+RUN chmod 0755 /usr/local/bin/nano-entrypoint /usr/local/bin/nano-mask-argv && perl -c /usr/local/bin/nano-mask-argv
 VOLUME ["/data", "/tls", "/tls-pub"]
 EXPOSE 5432
 # Starts as root only to read the root-owned 0600 secret, then drops to uid 999.

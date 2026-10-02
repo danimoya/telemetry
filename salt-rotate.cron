@@ -1,14 +1,12 @@
-# Weekly salt rotation — fires Monday 00:05 UTC.
+# Weekly jobs for the telemetry receiver.
 #
-# Generates a new 32-byte salt, writes it to $SALT_FILE (mode 0600), and
-# bounces the receiver process so SALT is reloaded. After rotation,
-# hashes from the previous week can no longer be correlated with hashes
-# from the new week, even given the same (ip, installation_id).
+# Salt rotation no longer needs cron. Since 2026-10-02 the receiver keeps the salt for the current
+# ISO week in $SALT_FILE (the telemetry_salt volume, format "<YYYY-WW> <64 hex>", mode 0600), so a
+# restart mid-week keeps it. The first ping of a new week replaces it with a fresh random salt
+# (receiver/persisted-salt.js). Last week's salt is overwritten, so hashes from different weeks
+# cannot be linked.
 #
-#   crontab -e   # add the following line, replacing paths
-
-5 0 * * 1 head -c 32 /dev/urandom | xxd -p -c 64 > /run/telemetry/salt.new \
-            && chmod 600 /run/telemetry/salt.new \
-            && mv /run/telemetry/salt.new /run/telemetry/salt \
-            && systemctl restart telemetry-receiver.service \
-            && /opt/telemetry/receiver/finalise-week.sh
+# Still needed weekly: roll completed weeks into pings_weekly (see finalise-week.sh). Example entry
+# for the app user's crontab (Monday 00:05 UTC):
+#
+#   5 0 * * 1 FINALISE_LOG=$HOME/.local/state/telemetry-finalise.log /opt/telemetry/receiver/finalise-week.sh

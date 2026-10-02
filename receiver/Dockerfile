@@ -9,7 +9,7 @@ RUN mkdir -p /run/telemetry
 COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 
-COPY server.js ./
+COPY server.js persisted-salt.js ./
 COPY entrypoint.sh /usr/local/bin/receiver-entrypoint
 RUN chmod 0755 /usr/local/bin/receiver-entrypoint
 

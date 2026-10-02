@@ -29,3 +29,18 @@ schema/code to verify that the policy and the implementation agree.
 - 3 duplicate `(week_bucket, hash)` rows (the old engine did not enforce the primary key) were
   collapsed to one row each, as the receiver always intended; published counts are unchanged.
 - Fields, hashing, salt rotation and retention are unchanged.
+
+## 2026-10-02 (later) — persisted weekly salt, corrections
+
+- Salt: now persisted for the current ISO week (file on the receiver's private volume, mode 0600)
+  and replaced by a fresh random salt at the first ping of each new week. Before this, the salt
+  lived in memory only and changed at every receiver restart, so a mid-week restart could count an
+  installation twice that week (possible for week 2026-40). The weekly rotation cron described in
+  the 2026-05-03 entry was found not installed on the host; between restarts the same salt was used
+  across weeks. Every hash includes the ISO week, so the same installation still got a different
+  hash each week.
+- Correction to the previous entry: the database requires neither TLS nor the post-quantum key
+  exchange by itself (HeliosDB-Nano #53). Both hold because the receiver is the only client that can
+  reach it and always connects with verified TLS and X25519MLKEM768. Since this change the host
+  cannot reach the database network either.
+- Fields, hashing inputs and retention are unchanged.

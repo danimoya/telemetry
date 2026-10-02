@@ -6,7 +6,8 @@
 #   ops/telemetry-db-backup.sh --san-drill   daily run + restore drill of the newest SAN copy today
 #   ops/telemetry-db-backup.sh --local-only  local backup + drill, no SAN upload
 #   ops/telemetry-db-backup.sh --check       monitor (cron hourly): alert when the last success is
-#                                            >36 h old, or the last SAN drill failed / is >8 days old
+#                                            >36 h old, or the last SAN drill failed / is >8 days old,
+#                                            or the engine's --password is not masked in its argv
 #   ops/telemetry-db-backup.sh --list        what is on the SAN
 #   ops/telemetry-db-backup.sh --drill FILE  restore drill of one archive (local file)
 #
@@ -40,7 +41,8 @@ SAN_ROOT="${TELEMETRY_SAN_ROOT:-backups/heliosdb/telemetry}"   # relative to the
 OUT="${TELEMETRY_BACKUP_ROOT:-$HOME/backups/heliosdb-telemetry}"
 STATE="${TELEMETRY_BACKUP_STATE:-$HOME/.local/state/telemetry-db-backup}"
 ENV_FILE="${TELEMETRY_ALERT_ENV:-/path/to/alert-smtp.env}"
-SECRET=/etc/heliosdb-telemetry/db.env
+SECRET=/etc/heliosdb-telemetry/db.env               # engine: password + encryption key
+CLIENT_SECRET=/etc/heliosdb-telemetry/receiver.env  # client: password only
 DB=telemetry-heliosdb; APP=telemetry-receiver
 SUBNET=10.250.21.0/24   # pinned: Docker's default address pools are exhausted on this host
 KEEP_LOCAL_DAYS=14; KEEP_DAILY_DAYS=7; KEEP_WEEKLY_DAYS=28; KEEP_MONTHLY_MONTHS=3
@@ -167,6 +169,25 @@ if [ "$MODE" = check ]; then
   drill=$(python3 -c "import json;d=json.load(open('$STATE/last-san-drill.json'));print(d['at'],str(d.get('ok')).lower())" 2>/dev/null || echo "0 false")
   [ "${drill#* }" = true ] || issues+=("the last SAN restore drill did not pass")
   [ $((now - ${drill%% *})) -le $((8 * 86400)) ] || issues+=("no SAN restore drill in the last 8 days")
+  # The engine's --password must read as '*' in /proc/<pid>/cmdline (db/nano/mask-argv.pl). The
+  # engine is the child of the container's init (tini). Prints no value.
+  masked=$(python3 - "$(docker inspect -f '{{.State.Pid}}' "$DB" 2>/dev/null || echo 0)" <<'PY' 2>/dev/null || echo error
+import sys
+init = sys.argv[1]
+kids = open(f'/proc/{init}/task/{init}/children').read().split() if init != '0' else []
+for pid in [init] + kids:
+    try:
+        args = open(f'/proc/{pid}/cmdline', 'rb').read().split(b'\0')
+    except OSError:
+        continue
+    if b'--password' in args:
+        v = args[args.index(b'--password') + 1]
+        print('masked' if v and set(v) == {ord('*')} else 'VISIBLE')
+        sys.exit(0)
+print('no-engine')
+PY
+)
+  [ "$masked" = masked ] || issues+=("telemetry-heliosdb --password is not masked in its command line ($masked)")
   if [ ${#issues[@]} -eq 0 ]; then log "check: healthy"; exit 0; fi
   msg=$(printf '%s; ' "${issues[@]}"); log "check: $msg"
   last=$(cat "$STATE/check-last-alert" 2>/dev/null || echo 0)
@@ -187,13 +208,14 @@ drill() {
   local archive="$1" lo="$2" hi="$3" image app_image restored ok
   image=$(docker inspect -f '{{.Config.Image}}' "$DB"); app_image=$(docker inspect -f '{{.Config.Image}}' "$APP")
   DRILL_TAG="telemetry-drill-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  docker network create --internal --subnet "$SUBNET" "$DRILL_TAG" >/dev/null
+  # No host address on the drill bridge either: no host user can reach the scratch engine.
+  docker network create --internal --subnet "$SUBNET" -o com.docker.network.bridge.inhibit_ipv4=true "$DRILL_TAG" >/dev/null
   gunzip -c "$archive" | docker run --rm -i --network none -v "$DRILL_TAG-data:/data" alpine \
     sh -c 'tar -C /data -xf - && chown -R 999:999 /data'
-  docker run -d --name "$DRILL_TAG" --network "$DRILL_TAG" --network-alias telemetry-heliosdb -e TLS_CN=telemetry-heliosdb \
+  docker run -d --init --name "$DRILL_TAG" --network "$DRILL_TAG" --network-alias telemetry-heliosdb -e TLS_CN=telemetry-heliosdb \
     -v "$SECRET:/run/secrets/db.env:ro" -v "$DRILL_TAG-data:/data" -v "$DRILL_TAG-tls:/tls" -v "$DRILL_TAG-tlspub:/tls-pub" "$image" >/dev/null
   for _ in $(seq 1 30); do docker logs "$DRILL_TAG" 2>&1 | grep -q "Server ready" && break; sleep 1; done
-  restored=$(docker run --rm --network "$DRILL_TAG" -v "$SECRET:/run/secrets/db.env:ro" -v "$DRILL_TAG-tlspub:/tls-pub:ro" \
+  restored=$(docker run --rm --network "$DRILL_TAG" -v "$CLIENT_SECRET:/run/secrets/db.env:ro" -v "$DRILL_TAG-tlspub:/tls-pub:ro" \
     -e 'PG_URL=postgresql://postgres@telemetry-heliosdb:5432/heliosdb?sslmode=verify-full&sslrootcert=/tls-pub/server.crt' \
     "$app_image" node -e "$COUNT_JS" $TABLES)
   ok=$(python3 -c "
