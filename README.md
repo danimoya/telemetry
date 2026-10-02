@@ -52,14 +52,25 @@ Per-row data is dropped after **90 days**. Aggregate counts are kept indefinitel
 ```
 telemetry/
 ├── README.md          # this file
-├── docker-compose.yml # one container: heliosdb + receiver-fastify
+├── docker-compose.yml # telemetry-heliosdb (Nano 4.41, encrypted, PQC TLS) + receiver
 ├── receiver/          # Node/Fastify app — single endpoint, single table
 │   ├── server.js
+│   ├── entrypoint.sh  # reads the DB password from the compose secret, drops root
 │   └── package.json
+├── db/nano/           # HeliosDB-Nano 4.41.0 image (official release, sha256-pinned)
+├── db/migrate/        # copy + verify tool used for the 2026-10-02 cutover
+├── ops/               # encrypted backup + restore drill + SAN rotation; TLS group check
+├── docs/              # NANO-4.41-MIGRATION.md
 ├── schema.sql         # pings table + retention job
 ├── salt-rotate.cron   # weekly cron that rolls the salt
 └── ROOM-FOR-AUDIT.md  # changelog of policy changes (append-only)
 ```
+
+## Storage
+
+The rows live in a dedicated HeliosDB-Nano 4.41.0 store, encrypted at rest (AES-256-GCM), reached
+only over TLS 1.3 with the X25519MLKEM768 post-quantum hybrid key exchange and SCRAM-SHA-256, on an
+internal Docker network. Details, and how the rows were moved there: `docs/NANO-4.41-MIGRATION.md`.
 
 ## Why publish this
 
