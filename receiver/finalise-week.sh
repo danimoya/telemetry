@@ -12,7 +12,8 @@
 #   - The receiver and its HeliosDB-Nano live in a docker compose
 #     stack named `telemetry`.
 #   - This script `docker exec`s into the receiver container, which has
-#     the right PG_URL env baked in, and runs psql there.
+#     the right PG_URL env baked in (TLS verify-full, password from the
+#     compose secret), and runs the SQL through node-pg there.
 #   - Run from the host: bash /opt/telemetry/receiver/finalise-week.sh
 #
 # Idempotent.
@@ -61,7 +62,9 @@ EOF
 # psql isn't installed in the heliosdb container, but the receiver
 # container has node-pg. Easier: pipe SQL through a tiny node REPL.
 # This keeps the dependency surface to what the receiver already has.
-docker exec -i "$RECEIVER" node -e '
+# receiver-entrypoint exports PGPASSWORD from the compose secret (PG_URL carries no password since
+# the 2026-10-02 move to Nano 4.41 + TLS) and drops to the `node` user.
+docker exec -i "$RECEIVER" receiver-entrypoint node -e '
   const pg = require("pg");
   const url = process.env.PG_URL;
   if (!url) { console.error("PG_URL not set"); process.exit(2); }

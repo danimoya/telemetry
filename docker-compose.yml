@@ -1,55 +1,81 @@
 services:
-  # HeliosDB-Nano stores the (week_bucket, hash, version) rows. The
-  # receiver workload is small and uses only basic SQL (no
-  # information_schema, no migrations framework), which sidesteps the
-  # TypeORM-blocking bugs documented for the dashboard at
-  # claude-dashboard:docs/heliosdb-bugs.md. Bootstrap runs CREATE TABLE
-  # IF NOT EXISTS from the receiver process on first connect.
+  # HeliosDB-Nano 4.41.0 (official release, db/nano/): AES-256-GCM at rest, TLS with the
+  # X25519MLKEM768 post-quantum hybrid key exchange, SCRAM-SHA-256, durable commits, HTTP/MCP
+  # listener off. Password + encryption key: /etc/heliosdb-telemetry/db.env (root, 0600) as a compose
+  # secret; losing the key loses the store (private operations runbook).
+  # The store was CREATED by 4.41.0 (marker /data/.heliosdb-store) and the image refuses a data
+  # directory it did not create. The legacy 3.x volume telemetry_telemetry_heliosdb is the rollback
+  # copy and is deliberately NOT declared here (so `docker compose down -v` cannot delete it); never
+  # point a 4.x engine at it (docs/NANO-4.41-MIGRATION.md).
+  # The receiver workload is small and uses only basic SQL; it runs CREATE TABLE IF NOT EXISTS
+  # itself on first connect.
   heliosdb:
-    image: heliosdb-nano-v2:latest
+    build:
+      context: ./db/nano
+    image: telemetry-heliosdb:4.41.0
     container_name: telemetry-heliosdb
     restart: unless-stopped
-    command:
-      - start
-      - --data-dir=/data
-      - --listen=0.0.0.0
-      - --port=5432
-      # Nano >= 3.32 refuses trust auth on 0.0.0.0 (crash-looped from 2026-05-25 to 2026-10-01).
-      - --auth=password
-      - --password=${TELEMETRY_DB_PASSWORD:?set TELEMETRY_DB_PASSWORD in .env}
     environment:
-      HELIOSDB_DATA_DIR: /data
-      HELIOSDB_LOG_LEVEL: info
-      RUST_BACKTRACE: "1"
+      TLS_CN: telemetry-heliosdb
+    secrets:
+      - source: telemetry_db
+        target: db.env
     volumes:
-      - telemetry_heliosdb:/data
+      - telemetry_heliosdb_441:/data
+      - telemetry_heliosdb_tls:/tls
+      - telemetry_heliosdb_tlspub:/tls-pub
     networks:
-      - internal
+      - db
+    healthcheck:
+      test: ["CMD-SHELL", "openssl s_client -starttls postgres -connect 127.0.0.1:5432 -brief </dev/null 2>&1 | grep -q 'CONNECTION ESTABLISHED'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   receiver:
+    # Build from a clean checkout (git worktree), not from a working tree with uncommitted edits.
     build: ./receiver
+    image: telemetry-receiver:4.41-pqc
     container_name: telemetry-receiver
     restart: unless-stopped
     environment:
       PORT: "4080"
-      # Nano serves a single fixed database named `heliosdb`; user is
-      # the same. Auth=trust on the container-internal network only.
-      PG_URL: postgres://heliosdb:${TELEMETRY_DB_PASSWORD}@heliosdb:5432/heliosdb
+      # Nano serves a single database named `heliosdb`; SCRAM works for the bootstrap role `postgres`
+      # only (HeliosDB-Nano #49). No password in the URL: the entrypoint exports PGPASSWORD from the
+      # secret. verify-full pins the self-signed server certificate and checks the host name.
+      PG_URL: postgresql://postgres@telemetry-heliosdb:5432/heliosdb?sslmode=verify-full&sslrootcert=/tls-pub/server.crt
       SALT_FILE: /run/telemetry/salt
+    secrets:
+      - source: telemetry_db
+        target: db.env
     volumes:
       - telemetry_salt:/run/telemetry
+      - telemetry_heliosdb_tlspub:/tls-pub:ro
     depends_on:
-      - heliosdb
+      heliosdb:
+        condition: service_healthy
     networks:
-      - internal
+      - db
       - management-network
 
+secrets:
+  telemetry_db:
+    file: /etc/heliosdb-telemetry/db.env
+
 volumes:
-  telemetry_heliosdb:
+  telemetry_heliosdb_441:
+  telemetry_heliosdb_tls:
+  telemetry_heliosdb_tlspub:
   telemetry_salt:
 
 networks:
-  internal:
+  # Database traffic only. Pinned: Docker's default address pools are exhausted on this host.
+  db:
     driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.250.20.0/24
   management-network:
     external: true
