@@ -57,7 +57,7 @@ Environment = "HELIOSDB_ENCRYPTION_KEY"
 TOML
 chmod 0644 "$CONFIG"
 
-# 4.41 accepts the password only as --password (no environment variable or file option), so it is
+# 4.41 accepts the password only as --password (no env/file option, HeliosDB-Nano #38), so it is
 # in the engine's argv and readable by every host user through /proc/<pid>/cmdline. nano-mask-argv
 # waits until the engine listens, then overwrites the value with '*' in the engine's argv memory.
 # It runs as the engine's uid, and its pid is this shell's pid, which `exec` turns into the engine.

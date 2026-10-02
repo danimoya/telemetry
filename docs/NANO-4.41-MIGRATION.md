@@ -15,7 +15,7 @@ the private operations runbook, never here.
 | Durability | `storage.durable_commit = true` (fsync at COMMIT) |
 | Network | `telemetry_db` (internal, 10.250.20.0/24, `inhibit_ipv4`: the host has no address on it); only the receiver joins it; no published port; HTTP/MCP listener off |
 | Secrets | `/etc/heliosdb-telemetry/db.env` (root, 0600): `DB_PASSWORD`, `DB_ENCRYPTION_KEY`, compose secret `telemetry_db`, mounted in the engine only. `/etc/heliosdb-telemetry/receiver.env` (root, 0600): `DB_PASSWORD` only, compose secret `telemetry_db_client`, mounted in the receiver. Both are written by `ops/rotate-db-password.sh`. Both entrypoints start as root only to read their file, then drop to uid 999 (DB) / 1000 `node` (receiver); the receiver exports the password as `PGPASSWORD`, and `PG_URL` carries none. Root on the host, or `docker exec` (root in the container), can read the mounted file and the processes' environment |
-| Password on the command line | Nano 4.41 takes the password only as `--password` (no environment variable or file option). The entrypoint starts `nano-mask-argv` (`db/nano/mask-argv.pl`), which overwrites the value with `*` in the engine's argv once it listens, so `/proc/<pid>/cmdline` and `ps` show `--password ****…`. The value is readable from exec until the listener is up (under a second, at each engine start). The hourly `ops/telemetry-db-backup.sh --check` alerts if the value is ever visible |
+| Password on the command line | Nano 4.41 takes the password only as `--password` (no environment variable or file option, HeliosDB-Nano #38). The entrypoint starts `nano-mask-argv` (`db/nano/mask-argv.pl`), which overwrites the value with `*` in the engine's argv once it listens, so `/proc/<pid>/cmdline` and `ps` show `--password ****…`. The value is readable from exec until the listener is up (under a second, at each engine start). The hourly `ops/telemetry-db-backup.sh --check` alerts if the value is ever visible |
 | Volumes | `telemetry_telemetry_heliosdb_441` (store), `telemetry_telemetry_heliosdb_tls` (key + cert, DB only), `telemetry_telemetry_heliosdb_tlspub` (cert only, read-only in the receiver) |
 | Client | receiver on `node:24-trixie-slim` (Node 24.21, OpenSSL 3.5.8): `PG_URL=postgresql://postgres@telemetry-heliosdb:5432/heliosdb?sslmode=verify-full&sslrootcert=/tls-pub/server.crt` — node-postgres pins the self-signed certificate and checks the host name |
 
@@ -116,7 +116,7 @@ A review of the cutover found statements above that were not accurate, and gaps.
   Hiding all processes host-wide (`hidepid=2`) was not done: on this host it would also hide
   processes from root daemons that run without `CAP_SYS_PTRACE` (systemd-logind, polkit) and from
   running sessions. A proper fix needs an environment variable or file option for the password in
-  Nano.
+  Nano (HeliosDB-Nano #38, open).
 - **"The receiver gets only the password" was wrong.** The receiver mounted the whole `db.env`,
   encryption key included. It now gets `receiver.env`, which holds the password only.
 - **The server does not enforce TLS or the post-quantum group.** See "What enforces TLS and the
@@ -127,3 +127,8 @@ A review of the cutover found statements above that were not accurate, and gaps.
 - **Schema drift.** The receiver's bootstrap DDL and `schema.sql` still said
   `received_at … NOT NULL`, while the live table allows NULL (see "How the data moved"). Both now
   match the live table, so a fresh store gets the same schema and accepts the migrated row.
+
+Deployed 2026-10-02 09:47:57–09:48:14 UTC (images built from commit `6375b97`; about 17 s without a
+receiver, stack recreated so the `telemetry_db` network could be rebuilt without a host address).
+Rollback images: `telemetry-heliosdb:rollback-20261002-premask`,
+`telemetry-receiver:rollback-20261002-presalt`; commands in the private runbook (section 10.6).
