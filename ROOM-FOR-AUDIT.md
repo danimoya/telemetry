@@ -44,3 +44,10 @@ schema/code to verify that the policy and the implementation agree.
   reach it and always connects with verified TLS and X25519MLKEM768. Since this change the host
   cannot reach the database network either.
 - Fields, hashing inputs and retention are unchanged.
+
+## 2026-10-02 (later) — old copies removed
+
+- The rows stored from 2026-05-03 to 2026-10-02 in another service's database (see the first
+  2026-10-02 entry) were checked against the encrypted store's copy and then deleted from that
+  database. The operator keeps a private export of them for rollback only.
+- Fields, hashing inputs and retention are unchanged.

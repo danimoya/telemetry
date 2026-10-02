@@ -29,22 +29,31 @@
 #  5. On Sundays (or when the last SAN drill is >7 days old, or with --san-drill): download the
 #     newest SAN daily, verify its sha256 and drill it like step 2.
 #
-# Logic follows the operator's other HeliosDB backup scripts. The archives stay encrypted; the key is NOT stored with them: it is in
-# /etc/heliosdb-telemetry/db.env (root 0600) and, separately, in a separate secrets directory on the SAN.
-# Runs as `app`; docker bind-mounts the root-only secret, so no sudo is needed.
-# Failure: nonzero exit, a "TELEMETRY DB BACKUP FAILED" log line, an email (SMTP settings from the
-# Cloud v2 .env, recipient ADMIN_EMAIL/CONTACT_TO), state in $STATE that --check alerts on.
+# The archives stay encrypted; the key is NOT stored with them: it is in
+# /etc/heliosdb-telemetry/db.env (root 0600) and, separately, in a secrets directory on the SAN.
+# Runs as the deploy user; docker bind-mounts the root-only secret, so no sudo is needed.
+# Failure: nonzero exit, a "TELEMETRY DB BACKUP FAILED" log line, an email (SMTP settings from
+# $TELEMETRY_ALERT_ENV, recipient ADMIN_EMAIL/CONTACT_TO), state in $STATE that --check alerts on.
+#
+# Host-specific settings are kept out of the repository, in an optional shell-format file
+# (default ~/.config/telemetry/backup.env, mode 0600), e.g.:
+#   TELEMETRY_SAN_HOST=<ssh host alias of the SAN>
+#   TELEMETRY_ALERT_ENV=<env file with SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/SMTP_FROM/ADMIN_EMAIL>
+#   TELEMETRY_CONTACT_ENV=<fallback env file with CONTACT_TO>
 set -Eeuo pipefail
 
-SAN_HOST="${TELEMETRY_SAN_HOST:-backup-host}"
+CONF="${TELEMETRY_BACKUP_CONF:-$HOME/.config/telemetry/backup.env}"
+if [ -r "$CONF" ]; then set -a; . "$CONF"; set +a; fi
+SAN_HOST="${TELEMETRY_SAN_HOST:-}"
 SAN_ROOT="${TELEMETRY_SAN_ROOT:-backups/heliosdb/telemetry}"   # relative to the SAN user's home
 OUT="${TELEMETRY_BACKUP_ROOT:-$HOME/backups/heliosdb-telemetry}"
 STATE="${TELEMETRY_BACKUP_STATE:-$HOME/.local/state/telemetry-db-backup}"
-ENV_FILE="${TELEMETRY_ALERT_ENV:-/path/to/alert-smtp.env}"
+ENV_FILE="${TELEMETRY_ALERT_ENV:-}"
+CONTACT_ENV="${TELEMETRY_CONTACT_ENV:-}"
 SECRET=/etc/heliosdb-telemetry/db.env               # engine: password + encryption key
 CLIENT_SECRET=/etc/heliosdb-telemetry/receiver.env  # client: password only
 DB=telemetry-heliosdb; APP=telemetry-receiver
-SUBNET=10.250.21.0/24   # pinned: Docker's default address pools are exhausted on this host
+SUBNET=10.250.21.0/24   # pinned: the host's default Docker address pools are exhausted
 KEEP_LOCAL_DAYS=14; KEEP_DAILY_DAYS=7; KEEP_WEEKLY_DAYS=28; KEEP_MONTHLY_MONTHS=3
 NAME_RE='^telemetry-db-[0-9]{8}T[0-9]{6}Z\.tar\.gz(\.sha256)?$'
 ARCHIVE_RE='^telemetry-db-[0-9]{8}T[0-9]{6}Z\.tar\.gz$'
@@ -81,7 +90,7 @@ log() { echo "$(date -u +%FT%TZ) [telemetry-db-backup] $*"; }
 
 alert() {  # alert <subject> <body>: never fails the caller
   local subject="$1" body="$2"
-  if ! ALERT_SUBJECT="$subject" ALERT_BODY="$body" ENV_FILE="$ENV_FILE" python3 - <<'PY'
+  if ! ALERT_SUBJECT="$subject" ALERT_BODY="$body" ENV_FILE="$ENV_FILE" CONTACT_ENV="$CONTACT_ENV" python3 - <<'PY'
 import email.message, os, pathlib, smtplib, ssl, sys
 def load(path):
     cfg = {}
@@ -94,9 +103,9 @@ def load(path):
     except OSError:
         pass
     return cfg
-cfg = load(os.environ['ENV_FILE'])
+cfg = load(os.environ['ENV_FILE']) if os.environ.get('ENV_FILE') else {}
 to = (os.environ.get('TELEMETRY_ALERT_TO') or cfg.get('ADMIN_EMAIL') or cfg.get('CONTACT_TO')
-      or load('/path/to/contact.env').get('CONTACT_TO'))
+      or (os.environ.get('CONTACT_ENV') and load(os.environ['CONTACT_ENV']).get('CONTACT_TO')))
 if not (to and cfg.get('SMTP_HOST') and cfg.get('SMTP_FROM')):
     print('alert: no recipient or SMTP settings', file=sys.stderr); sys.exit(1)
 m = email.message.EmailMessage()
@@ -150,7 +159,7 @@ $(tail -n 40 "$STATE/backup.log" 2>/dev/null || true)"
 }
 trap 'on_error $LINENO' ERR
 
-san() { ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=8 "$SAN_HOST" "$@"; }
+san() { [ -n "$SAN_HOST" ] || { echo "TELEMETRY_SAN_HOST is not set (see $CONF)" >&2; return 1; }; ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=8 "$SAN_HOST" "$@"; }
 ts_epoch() { local t="$1"; date -u -d "${t:0:4}-${t:4:2}-${t:6:2} ${t:9:2}:${t:11:2}:${t:13:2}" +%s; }
 name_ts() { local n="${1#telemetry-db-}"; echo "${n%%.tar.gz*}"; }
 san_list() { san "cd ~/$SAN_ROOT/$1 && ls -1A" | grep -E "$ARCHIVE_RE" | sort || true; }

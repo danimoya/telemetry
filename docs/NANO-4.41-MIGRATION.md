@@ -1,8 +1,8 @@
 # Telemetry store on HeliosDB-Nano 4.41.0 — encrypted at rest, post-quantum TLS
 
 Cut over 2026-10-02 (09:23:43–09:23:56 UTC, 12.5 s without a receiver). Secrets and the operator
-procedures (keys, backup, restore, rotation, rollback) live in the private runbook
-the private operations runbook, never here.
+procedures (keys, backup, restore, rotation, rollback) live in the operator's private runbook,
+never here.
 
 ## What runs now
 
@@ -80,9 +80,10 @@ Result at cutover (source read with the receiver stopped):
 | `pings` | 15 | 3 | 12 / 12 | `74c0bc2779189bd2…` = `74c0bc2779189bd2…` |
 | `pings_weekly` | 0 | 0 | 0 / 0 | empty = empty |
 
-The full report and an export of every source row (all 15, duplicates included) are kept on the host
-under `~/backups/heliosdb-telemetry/migration-2026-10-02/`. The source rows were not deleted from
-`other-service-db`.
+The full report and an export of every source row (all 15, duplicates included) are kept
+in the operator's private backups. After a second check that they matched this export, the source
+tables `pings` and `pings_weekly` were exported once more and dropped from the other service's
+database on 2026-10-02; nothing else in that database was touched.
 
 ## Backups
 
